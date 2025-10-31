@@ -82,6 +82,54 @@ def list_linked_pages(url: str) -> list:
     return links
 
 
+def list_month_urls(year_url: str) -> list:
+    """Return candidate month URLs found on a year page.
+
+    Heuristic: links under the same collection path that include the year (YYYY)
+    in their path and are different from the provided year_url.
+    """
+    try:
+        resp = requests.get(year_url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch year url {year_url}: {e}")
+
+    parsed = urlparse(year_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    year = None
+    # Try to extract 4-digit year from the URL
+    import re
+    m = re.search(r"(19|20)\d{2}", year_url)
+    if m:
+        year = m.group(0)
+
+    links = []
+    seen = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith("javascript:"):
+            continue
+        full = normalize_link(base, href)
+        # same-domain only
+        if parsed.netloc not in urlparse(full).netloc:
+            continue
+        if full == year_url:
+            continue
+        # If year extracted, prefer links that include the year in path
+        if year and year not in full:
+            # also allow links that look like month pages by path depth
+            # but skip if they are top-level navigation
+            continue
+        if full in seen:
+            continue
+        seen.add(full)
+        links.append(full)
+
+    return links
+
+
 def extract_titles_from_date_url(date_url: str) -> list:
     """Fetch a date page and extract candidate titles."""
     try:
@@ -149,6 +197,7 @@ def main():
     parser = argparse.ArgumentParser(description="Hierarchical NDLI TOI title scraper")
     parser.add_argument("--start-url", required=True)
     parser.add_argument("--list-years", action="store_true", help="List candidate year URLs from the start page and exit")
+    parser.add_argument("--list-months", action="store_true", help="List candidate month URLs from a year page and exit")
     parser.add_argument("--output", default="output_titles.jsonl")
     parser.add_argument("--delay", type=float, default=1.0)
     parser.add_argument("--max-years", type=int)
@@ -161,6 +210,11 @@ def main():
         years = list_year_urls(args.start_url)
         for y in years:
             print(y)
+        return
+    if args.list_months:
+        months = list_month_urls(args.start_url)
+        for m in months:
+            print(m)
         return
 
     run_hierarchical_scrape(
