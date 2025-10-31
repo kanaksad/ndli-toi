@@ -219,6 +219,53 @@ def extract_titles_from_date_url(date_url: str) -> list:
     return out.get("titles", [])
 
 
+def list_headline_urls(date_url: str) -> list:
+    """Return list of (title, url) tuples for headlines on a date page.
+
+    Heuristic: headline/article URLs appear under `/nw_document/toi/timesofindia/<numeric_id>`
+    or as full URLs ending with a numeric ID. We filter anchors whose href path
+    ends with a number and whose text looks like a headline.
+    """
+    try:
+        resp = requests.get(date_url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch date url {date_url}: {e}")
+
+    parsed = urlparse(date_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    import re
+    pattern = re.compile(r"/nw_document/toi/timesofindia/\d+$")
+
+    results = []
+    seen = set()
+
+    # Search within the month/day stitching container first if available
+    # fall back to whole document
+    main = soup.find("article") or soup.find(id="main") or soup.find("main") or soup
+
+    for a in main.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith("javascript:"):
+            continue
+        full = normalize_link(base, href)
+        # Only keep anchors whose path ends with a numeric id under the collection
+        if not pattern.search(urlparse(full).path):
+            continue
+        text = a.get_text(separator=" ", strip=True)
+        if not text or len(text) < 4:
+            # skip very short nav text
+            continue
+        if full in seen:
+            continue
+        seen.add(full)
+        results.append((text, full))
+
+    return results
+
+
 def run_hierarchical_scrape(start_url: str,
                             output_path: str = "output_titles.jsonl",
                             delay: float = 1.0,
@@ -275,6 +322,7 @@ def main():
     parser.add_argument("--list-years", action="store_true", help="List candidate year URLs from the start page and exit")
     parser.add_argument("--list-months", action="store_true", help="List candidate month URLs from a year page and exit")
     parser.add_argument("--list-dates", action="store_true", help="List candidate date URLs from a month page and exit")
+    parser.add_argument("--list-headlines", action="store_true", help="List headline title & url pairs from a date page and exit")
     parser.add_argument("--output", default="output_titles.jsonl")
     parser.add_argument("--delay", type=float, default=1.0)
     parser.add_argument("--max-years", type=int)
@@ -298,6 +346,11 @@ def main():
         # print tab-separated: label \t url
         for label, url in dates:
             print(f"{label}\t{url}")
+        return
+    if args.list_headlines:
+        hits = list_headline_urls(args.start_url)
+        for title, url in hits:
+            print(f"{title}\t{url}")
         return
 
     run_hierarchical_scrape(
