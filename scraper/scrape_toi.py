@@ -130,6 +130,82 @@ def list_month_urls(year_url: str) -> list:
     return links
 
 
+def list_date_urls(month_url: str) -> list:
+    """Return list of (day_label, url) tuples found on a month page.
+
+    Heuristics used:
+    - Anchor text that is a day number (1..31) is mapped to that day.
+    - Anchor text that contains a day-month pattern (e.g., '1 Jan', '01-01-2017') is used.
+    - If no useful anchor text, attempt to extract a date-like token from the URL path.
+    The function returns an ordered list of (label, full_url).
+    """
+    try:
+        resp = requests.get(month_url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch month url {month_url}: {e}")
+
+    parsed = urlparse(month_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    candidates = []
+    seen = set()
+
+    import re
+
+    # Prefer the month-specific container in the stitching pane when available.
+    # The page uses an id like `col_toi_timesofindia_<month_last_segment>` where
+    # <month_last_segment> is the last path segment of the month_url. Restricting
+    # to this container avoids picking up unrelated navigation links.
+    last_segment = parsed.path.rstrip("/").split("/")[-1]
+    container_id = f"col_toi_timesofindia_{last_segment}"
+    main = soup.find(id=container_id)
+    if main is None:
+        # fallback to article/main or whole soup
+        main = soup.find("article") or soup.find(id="main") or soup.find("main") or soup
+
+    for a in main.find_all("a", href=True):
+        text = a.get_text(separator=" ", strip=True)
+        href = a["href"].strip()
+        if href.startswith("javascript:"):
+            continue
+        full = normalize_link(base, href)
+        if parsed.netloc not in urlparse(full).netloc:
+            continue
+
+        label = None
+        # simple day number
+        if re.fullmatch(r"\d{1,2}", text):
+            label = text
+        else:
+            # look for patterns like '01 Jan', '1-Jan-2017', '2017-01-01', '1 Jan 2017'
+            if re.search(r"\d{1,2}\s*[A-Za-z]{3,9}", text) or re.search(r"\d{4}-\d{2}-\d{2}", text) or re.search(r"\d{1,2}-[A-Za-z]{3,9}-\d{4}", text):
+                label = text
+
+        # if label still None, try to extract a date-like segment from URL
+        if label is None:
+            m = re.search(r"(19|20)\d{2}[-_/]?\d{1,2}[-_/]?\d{1,2}", full)
+            if m:
+                label = m.group(0)
+            else:
+                # try trailing numeric segment
+                m2 = re.search(r"/(\d{1,2})$", full)
+                if m2:
+                    label = m2.group(1)
+
+        if label is None:
+            # fallback: use the anchor text (may be noisy)
+            label = text if text else full
+
+        if full in seen:
+            continue
+        seen.add(full)
+        candidates.append((label, full))
+
+    return candidates
+
+
 def extract_titles_from_date_url(date_url: str) -> list:
     """Fetch a date page and extract candidate titles."""
     try:
@@ -198,6 +274,7 @@ def main():
     parser.add_argument("--start-url", required=True)
     parser.add_argument("--list-years", action="store_true", help="List candidate year URLs from the start page and exit")
     parser.add_argument("--list-months", action="store_true", help="List candidate month URLs from a year page and exit")
+    parser.add_argument("--list-dates", action="store_true", help="List candidate date URLs from a month page and exit")
     parser.add_argument("--output", default="output_titles.jsonl")
     parser.add_argument("--delay", type=float, default=1.0)
     parser.add_argument("--max-years", type=int)
@@ -215,6 +292,12 @@ def main():
         months = list_month_urls(args.start_url)
         for m in months:
             print(m)
+        return
+    if args.list_dates:
+        dates = list_date_urls(args.start_url)
+        # print tab-separated: label \t url
+        for label, url in dates:
+            print(f"{label}\t{url}")
         return
 
     run_hierarchical_scrape(
