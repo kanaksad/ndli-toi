@@ -37,3 +37,51 @@ def extract_text_and_title(html: str) -> Dict[str, Optional[str]]:
     text = "\n\n".join(texts) if texts else None
 
     return {"title": title, "text": text, "html": html}
+
+
+def extract_titles_from_page(html: str) -> Dict[str, list]:
+    """Extracts candidate article titles from a page that lists titles (dates page).
+
+    Returns a dict with a list of titles under key 'titles'. Titles are
+    best-effort text contents of anchors or list items filtered by length.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    candidates = []
+
+    # Prefer anchors inside main content/article
+    main = soup.find("article") or soup.find(id="main") or soup.find("main")
+    search_root = main if main is not None else soup
+
+    # Gather anchor texts
+    for a in search_root.find_all("a", href=True):
+        text = a.get_text(separator=" ", strip=True)
+        if not text:
+            continue
+        # filter out short nav labels
+        if len(text) < 4:
+            continue
+        # ignore month/day nav links that are just years or months (e.g., '2024')
+        if text.isdigit() and len(text) == 4:
+            continue
+        candidates.append(text)
+
+    # Also consider list items
+    for li in search_root.find_all("li"):
+        text = li.get_text(separator=" ", strip=True)
+        if not text:
+            continue
+        if len(text) < 4:
+            continue
+        candidates.append(text)
+
+    # Deduplicate while preserving order
+    seen = set()
+    titles = []
+    for t in candidates:
+        if t in seen:
+            continue
+        seen.add(t)
+        titles.append(t)
+
+    return {"titles": titles}

@@ -9,99 +9,169 @@ This script performs a breadth-first crawl limited to the ndl.gov.in domain and 
 import argparse
 import json
 import time
-from collections import deque
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
-from scraper.utils import extract_text_and_title
+from scraper.utils import extract_titles_from_page
 
 
-HEADERS = {"User-Agent": "ndli-toi-scraper/1.0 (+https://github.com/)"}
-
-
-def same_domain(base_netloc: str, url: str) -> bool:
-    try:
-        return urlparse(url).netloc.endswith(base_netloc)
-    except Exception:
-        return False
+HEADERS = {"User-Agent": "ndli-toi-titles-scraper/1.0 (+https://github.com/)"}
 
 
 def normalize_link(base: str, link: str) -> str:
     return urljoin(base, link)
 
 
-def is_probable_article(soup: BeautifulSoup) -> bool:
-    # Heuristic: contains <article> or multiple <p> tags
-    if soup.find("article"):
-        return True
-    pcount = len(soup.find_all("p"))
-    return pcount >= 5
+def list_year_urls(start_url: str) -> list:
+    """Return a list of candidate year URLs from the start page."""
+    try:
+        resp = requests.get(start_url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch start url {start_url}: {e}")
 
-
-def crawl(start_url: str, max_pages: int = 200, delay: float = 1.0, output_path: str = "output.jsonl"):
+    soup = BeautifulSoup(resp.text, "lxml")
     parsed = urlparse(start_url)
-    base_netloc = parsed.netloc
+    base = f"{parsed.scheme}://{parsed.netloc}"
 
-    q = deque([start_url])
-    seen = set([start_url])
+    years = []
+    seen = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith("javascript:"):
+            continue
+        full = normalize_link(base, href)
+        # Heuristic: year pages in this collection often contain 'IN__thetoi_'
+        if "/nw_document/toi/timesofindia/" in full and "IN__thetoi_" in full:
+            if full not in seen:
+                seen.add(full)
+                years.append(full)
+
+    return years
+
+
+def list_linked_pages(url: str) -> list:
+    """Return all same-domain links found on the given page."""
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        tqdm.write(f"Failed to fetch {url}: {e}")
+        return []
+
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    soup = BeautifulSoup(resp.text, "lxml")
+    links = []
+    seen = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith("javascript:"):
+            continue
+        full = normalize_link(base, href)
+        # Keep only links within same domain/collection path
+        if parsed.netloc not in urlparse(full).netloc:
+            continue
+        if full in seen:
+            continue
+        seen.add(full)
+        links.append(full)
+    return links
+
+
+def extract_titles_from_date_url(date_url: str) -> list:
+    """Fetch a date page and extract candidate titles."""
+    try:
+        resp = requests.get(date_url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        tqdm.write(f"Failed to fetch {date_url}: {e}")
+        return []
+
+    out = extract_titles_from_page(resp.text)
+    return out.get("titles", [])
+
+
+def run_hierarchical_scrape(start_url: str,
+                            output_path: str = "output_titles.jsonl",
+                            delay: float = 1.0,
+                            max_years: int = None,
+                            max_months: int = None,
+                            max_dates: int = None,
+                            max_titles_per_date: int = None):
+    """Run hierarchical scraping: list years, then months, then dates, then extract titles.
+
+    Writes JSON lines with {"year_url","month_url","date_url","title"}.
+    Parameters allow limiting the breadth/depth for small-scale experiments.
+    """
+    years = list_year_urls(start_url)
+    if max_years:
+        years = years[:max_years]
 
     with open(output_path, "w", encoding="utf-8") as out_f:
-        pbar = tqdm(total=max_pages, desc="pages")
-        pages = 0
-        while q and pages < max_pages:
-            url = q.popleft()
-            try:
-                resp = requests.get(url, headers=HEADERS, timeout=15)
-                resp.raise_for_status()
-                html = resp.text
-            except Exception as e:
-                tqdm.write(f"Failed to fetch {url}: {e}")
-                time.sleep(delay)
-                continue
+        pbar = tqdm(total=len(years), desc="years")
+        for y in years:
+            # From a year page, list month-like links
+            month_links = list_linked_pages(y)
+            # Heuristic: months often include the year in path or be under the year page
+            if max_months:
+                month_links = month_links[:max_months]
 
-            soup = BeautifulSoup(html, "lxml")
+            for m in month_links:
+                # From month page, there will be date links
+                date_links = list_linked_pages(m)
+                if max_dates:
+                    date_links = date_links[:max_dates]
 
-            # Save if probable article
-            if is_probable_article(soup):
-                data = extract_text_and_title(html)
-                record = {
-                    "url": url,
-                    "title": data.get("title"),
-                    "text": data.get("text"),
-                }
-                out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                for d in date_links:
+                    titles = extract_titles_from_date_url(d)
+                    if max_titles_per_date:
+                        titles = titles[:max_titles_per_date]
+                    for t in titles:
+                        record = {
+                            "year_url": y,
+                            "month_url": m,
+                            "date_url": d,
+                            "title": t,
+                        }
+                        out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    time.sleep(delay)
 
-            # Enqueue links from this page (domain-limited)
-            for a in soup.find_all("a", href=True):
-                href = a["href"].strip()
-                if href.startswith("javascript:"):
-                    continue
-                full = normalize_link(url, href)
-                if full in seen:
-                    continue
-                if not same_domain(base_netloc, full):
-                    continue
-                seen.add(full)
-                q.append(full)
-
-            pages += 1
             pbar.update(1)
             time.sleep(delay)
         pbar.close()
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Hierarchical NDLI TOI title scraper")
     parser.add_argument("--start-url", required=True)
-    parser.add_argument("--output", default="output.jsonl")
-    parser.add_argument("--max-pages", type=int, default=200)
+    parser.add_argument("--list-years", action="store_true", help="List candidate year URLs from the start page and exit")
+    parser.add_argument("--output", default="output_titles.jsonl")
     parser.add_argument("--delay", type=float, default=1.0)
+    parser.add_argument("--max-years", type=int)
+    parser.add_argument("--max-months", type=int)
+    parser.add_argument("--max-dates", type=int)
+    parser.add_argument("--max-titles-per-date", type=int)
     args = parser.parse_args()
 
-    crawl(args.start_url, max_pages=args.max_pages, delay=args.delay, output_path=args.output)
+    if args.list_years:
+        years = list_year_urls(args.start_url)
+        for y in years:
+            print(y)
+        return
+
+    run_hierarchical_scrape(
+        args.start_url,
+        output_path=args.output,
+        delay=args.delay,
+        max_years=args.max_years,
+        max_months=args.max_months,
+        max_dates=args.max_dates,
+        max_titles_per_date=args.max_titles_per_date,
+    )
 
 
 if __name__ == "__main__":
